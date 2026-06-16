@@ -4,9 +4,9 @@
   "allowed_actions": ["task", "claim", "renew", "result", "requeue", "review"],
   "presets": {
     "planner-executor-qa": {
-      "claire": ["task", "requeue", "review"],
-      "celina": ["claim", "renew", "result"],
-      "ariel": ["claim", "renew", "result", "review"]
+      "planner": ["task", "requeue", "review"],
+      "executor": ["claim", "renew", "result"],
+      "qa": ["claim", "renew", "result", "review"]
     }
   }
 }

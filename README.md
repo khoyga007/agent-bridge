@@ -1,83 +1,89 @@
 # agent-bridge
 
-Direct messaging between two agents (Claire = Claude Code, Celina = Codex) over MCP.
-No external deps, no neural-memory, no shared MD doc. Just a tiny stdio MCP server
-backed by an append-only `messages.jsonl`.
+A minimal, zero-dependency MCP stdio relay that lets multiple AI agents coordinate
+through a single shared, append-only log. No broker, no database, no daemon — just a
+tiny `server.js` per agent backed by `messages.jsonl`.
 
-## How it works
+Each agent runs its own copy of the server with a distinct `--self` address. All
+copies read and write the same files in the store directory, so coordination is
+just file I/O.
 
-- Each side runs its own copy of `server.js` with a `--self` address.
-- Messages append to one shared `messages.jsonl` in this folder.
-- `inbox` reads only what's addressed to you and tracks a per-agent read cursor
-  (`cursor.<self>.txt`), so you don't re-read old messages.
+## Features
 
-## Tools
+- **Messaging** — `send` / `inbox` / `sync` with per-agent byte-offset read cursors, threads, and receipts.
+- **Log rotation + prune** — generation-based rotation when the log grows past a size/line limit, plus safe pruning of generations every agent has already consumed.
+- **Task claim** — `task` / `claim` / `renew` / `result` / `requeue` with effectively-once semantics enforced by a deterministic, log-order reducer (no wall-clock arbitration).
+- **Structured reviews** — `review` / `reviews` record verdicts (`approve` / `request_changes`) with file-level issues.
+- **Advisory file locks** — `flock` / `funlock` / `flocks` so agents don't clobber each other's edits.
+- **Role-based gating** — optional `roles.json` policy that restricts which agent may perform which action. Enforced both at append time and inside the reducer (unauthorized records are dropped from derived state), so a non-compliant client can't corrupt shared state.
 
-| Tool | Args | Does |
-|------|------|------|
-| `send` | `to`, `msg`, `thread?`, `reply_to?` | Send a message. `to` = address string, array of addresses (group), or `'all'` (broadcast). |
-| `inbox` | `all?`, `peek?`, `since?` | Read messages to you (incl. group/broadcast). Default = unread only, advances cursor. |
-| `peers` | — | List other agents seen + your own address. |
-| `threads` | — | List threads involving you + latest message in each. |
-| `receipts` | `thread?`, `msg_id?` | Read receipts for messages visible to you. |
+## Quick start
 
-## Wire it up
-
-### Claire (Claude Code)
-
-Run once in a terminal:
+Each agent registers the server with its own address. Examples for three agents
+addressed `planner`, `executor`, and `qa`:
 
 ```
-claude mcp add agent-bridge --scope user -- node C:\Users\Asus1\.agent-bridge\server.js --self claire
+# Claude Code
+claude mcp add agent-bridge --scope user -- node /path/to/agent-bridge/server.js --self planner
 ```
-
-Or add to `~/.claude.json` (or project `.mcp.json`):
-
-```json
-{
-  "mcpServers": {
-    "agent-bridge": {
-      "command": "node",
-      "args": ["C:\\Users\\Asus1\\.agent-bridge\\server.js", "--self", "claire"]
-    }
-  }
-}
-```
-
-### Celina (Codex)
-
-Add to `~/.codex/config.toml`:
 
 ```toml
+# Codex (~/.codex/config.toml)
 [mcp_servers.agent-bridge]
 command = "node"
-args = ["C:\\Users\\Asus1\\.agent-bridge\\server.js", "--self", "celina"]
+args = ["/path/to/agent-bridge/server.js", "--self", "executor"]
 ```
 
-### Ariel (Antigravity)
-
-Add an MCP stdio server in Antigravity's MCP config:
-
 ```json
+// Generic MCP stdio config
 {
   "name": "agent-bridge",
   "type": "stdio",
   "command": "node",
-  "args": ["C:/Users/Asus1/.agent-bridge/server.js", "--self", "ariel"]
+  "args": ["/path/to/agent-bridge/server.js", "--self", "qa"]
 }
 ```
 
-Use forward slashes in the path. All agents share the same `server.js` + `messages.jsonl`.
+`--self <name>` is the agent's address and is required. `--store <dir>` overrides the
+store directory (defaults to the server's own folder). Use forward slashes in paths.
 
-## Usage
+## Tools
 
-- Claire: `send(to:"celina", msg:"...")`, then `inbox()` to read replies.
-- Celina: same, mirrored.
-- Each agent only "hears" while it's running a turn. For near real-time
-  back-and-forth, run a poll loop (`/loop`) that calls `inbox()` each tick.
+| Tool | Args | Description |
+|------|------|-------------|
+| `send` | `to`, `msg`, `thread?`, `reply_to?` | Send a message. `to` = address string, array (group), or `'all'` (broadcast). |
+| `inbox` | `all?`, `limit?`, `peek?`, `since?` | Read messages addressed to you. Default = unread only (limit 20), advances cursor. |
+| `sync` | `outbox?`, `limit?`, `peek?` | Append messages then read inbox in one round trip. |
+| `peers` | — | List agents seen plus your own address. |
+| `threads` | — | List threads involving you with the latest message in each. |
+| `receipts` | `thread?`, `msg_id?` | Read receipts for messages visible to you. |
+| `task` | `spec_hash`, `task_id?`, `msg?`, `requires_human?` | Append a task record. |
+| `claim` | `task_id`, `epoch?`, `lease_seconds?` | Claim a task epoch. First claim in log order wins. |
+| `renew` | `task_id`, `epoch?`, `lease_seconds?` | Extend your lease on a claimed task. |
+| `result` | `task_id`, `epoch?`, `result_hash?` | Record a task result (idempotent). |
+| `requeue` | `task_id`, `from_epoch?` | Bump a stale task to a new epoch for reclaiming. |
+| `review` | `target`, `verdict`, `issues?`, `msg?` | Append a structured review verdict. |
+| `reviews` | `target?` | List review verdict records. |
+| `flock` | `path`, `ttl?` | Acquire an advisory lock on a file path. |
+| `funlock` | `path` | Release a lock you hold. |
+| `flocks` | — | List active locks. |
+| `prune` | — | Delete rotated generations every live cursor has passed. |
 
-## Notes
+## Configuration
 
-- Address is fixed by `--self` at launch; keep `claire` / `celina` stable for routing.
-- `messages.jsonl` is the full transcript. Truncate it to reset history.
-- `thread` is optional grouping; carry the same id through a conversation.
+- `state.json` (auto-created): `max_lines`, `max_bytes` rotation triggers, `current_gen`, and `max_backlog` (prune escape hatch; `0` = off).
+- `roles.json` (optional): `policy_mode` (`off` / `advisory` / `enforce`), `active_preset`, and per-agent action grants. If missing or invalid, policy is off (fail-open). See `presets/` for example role sets.
+
+## Design notes
+
+- Single shared append-only log; readers track an absolute byte offset per generation.
+- Task arbitration is by **log order**, not wall-clock — the reducer is pure and deterministic, so every agent derives identical state from the same log.
+- Role gating is a **workflow guardrail, not a security boundary.** It prevents accidental out-of-role actions; it does not defend against a malicious process that writes the log directly.
+
+## Tests
+
+```
+npm test
+```
+
+Runs the full suite (`run-tests.js`): reducer, rotation, task-claim, sync, review, flock, and policy.

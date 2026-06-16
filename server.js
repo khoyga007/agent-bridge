@@ -1,10 +1,10 @@
 #!/usr/bin/env node
-// agent-bridge: minimal MCP stdio relay so two agents (claire <-> celina)
-// can message each other directly via a shared append-only JSONL log.
+// agent-bridge: minimal MCP stdio relay so multiple agents can message each
+// other directly via a shared append-only JSONL log.
 // No external deps. Newline-delimited JSON-RPC 2.0 over stdio (MCP stdio transport).
 //
 // Usage: node server.js --self <name>
-//   --self   this agent's address (claire | celina). Required.
+//   --self   this agent's address (any stable identifier). Required.
 //   --store  override store dir (default: this file's directory).
 
 const fs = require("fs");
@@ -853,11 +853,11 @@ function toolReceipts({ thread, msg_id } = {}) {
 const TOOLS = [
   {
     name: "send",
-    description: "Send a message to another agent. `to` may be one address ('celina'), an array (['celina','ariel']) for a group, or 'all' to broadcast to everyone. Appends to the shared bridge log.",
+    description: "Send a message to another agent. `to` may be one address ('executor'), an array (['executor','qa']) for a group, or 'all' to broadcast to everyone. Appends to the shared bridge log.",
     inputSchema: {
       type: "object",
       properties: {
-        to: { description: "Recipient(s): an address string ('claire'), an array of addresses, or 'all' for broadcast.", oneOf: [{ type: "string" }, { type: "array", items: { type: "string" } }] },
+        to: { description: "Recipient(s): an address string ('planner'), an array of addresses, or 'all' for broadcast.", oneOf: [{ type: "string" }, { type: "array", items: { type: "string" } }] },
         msg: { type: "string", description: "Message text." },
         thread: { type: "string", description: "Optional thread id to group a conversation." },
         reply_to: { type: "string", description: "Optional parent message id this message replies to." },

@@ -9,6 +9,11 @@ cursor.*.txt
 cursors/
 locks/
 
+# Internal planning docs (kept local)
+PLAN.md
+PROTOCOL.md
+P1P2-proposal.md
+
 # Test artifacts
 test-store-*/
 
