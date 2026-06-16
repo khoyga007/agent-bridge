@@ -9,7 +9,8 @@ const tests = [
   'test-sync.js',
   'test-review.js',
   'test-flock.js',
-  'test-policy.js'
+  'test-policy.js',
+  'test-viewer.js'
 ];
 
 let allPassed = true;

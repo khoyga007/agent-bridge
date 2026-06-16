@@ -28,8 +28,10 @@ const SELF = (arg("--self", process.env.BRIDGE_DASHBOARD_SELF) || "planner").tri
 const PORT = parseInt(arg("--port", process.env.PORT || "8787"), 10);
 const SERVER_JS = path.join(__dirname, "server.js");
 const LOG = path.join(STORE_DIR, "messages.jsonl");
+const RECEIPTS = path.join(STORE_DIR, "receipts.jsonl");
 const STATE = path.join(STORE_DIR, "state.json");
 const ROLES = path.join(STORE_DIR, "roles.json");
+const LOCKS_DIR = path.join(STORE_DIR, "locks");
 
 const reducer = require("./task-reducer");
 const reduceTasks = reducer.reduce || reducer;
@@ -37,6 +39,17 @@ const reduceTasks = reducer.reduce || reducer;
 // ---- read side (no locks; append-only log, tolerate a torn last line) ----
 function readState() {
   try { return JSON.parse(fs.readFileSync(STATE, "utf8")); } catch { return { current_gen: 0 }; }
+}
+function ensureServerState() {
+  const state = readState();
+  const next = {
+    current_gen: Number.isFinite(Number(state.current_gen)) ? Math.trunc(Number(state.current_gen)) : 0,
+    rotated_at: state.rotated_at ?? null,
+    max_lines: Number.isFinite(Number(state.max_lines)) && Number(state.max_lines) > 0 ? Math.trunc(Number(state.max_lines)) : 5000,
+    max_bytes: Number.isFinite(Number(state.max_bytes)) && Number(state.max_bytes) > 0 ? Math.trunc(Number(state.max_bytes)) : 5242880,
+    max_backlog: Number.isFinite(Number(state.max_backlog)) && Number(state.max_backlog) >= 0 ? Math.trunc(Number(state.max_backlog)) : 0,
+  };
+  try { fs.writeFileSync(STATE, JSON.stringify(next, null, 2) + "\n"); } catch {}
 }
 function readJsonl(file) {
   let text;
@@ -49,20 +62,24 @@ function readJsonl(file) {
   }
   return out;
 }
-function genPath(gen, currentGen) {
-  if (gen === currentGen) return LOG;
-  return path.join(STORE_DIR, `messages.${gen}.jsonl`);
+function genPath(active, gen, currentGen) {
+  if (gen === currentGen) return active;
+  const ext = active.endsWith(".jsonl") ? ".jsonl" : "";
+  const base = ext ? active.slice(0, -ext.length) : active;
+  return `${base}.${gen}${ext}`;
 }
-function readAll() {
+function readGenerations(active) {
   const currentGen = Math.max(0, Math.trunc(readState().current_gen || 0));
   const out = [];
   for (let gen = 0; gen <= currentGen; gen++) {
-    const file = genPath(gen, currentGen);
+    const file = genPath(active, gen, currentGen);
     if (gen !== currentGen && !fs.existsSync(file)) continue; // pruned archive
     out.push(...readJsonl(file));
   }
   return out;
 }
+function readAll() { return readGenerations(LOG); }
+function readReceipts() { return readGenerations(RECEIPTS); }
 function readRoles() {
   try { return JSON.parse(fs.readFileSync(ROLES, "utf8")); } catch { return null; }
 }
@@ -75,14 +92,48 @@ function taskState(records) {
   const map = reduceTasks(records, readRoles());
   return [...map.entries()].map(([id, s]) => ({ task_id: id, ...s }));
 }
+function reviews(records) {
+  return records
+    .filter((r) => r.type === "review" || r.thread === "reviews")
+    .map((r) => ({
+      id: r.id,
+      ts: r.ts,
+      reviewer: r.reviewer || r.from,
+      target: r.target || null,
+      verdict: r.verdict || null,
+      issues: Array.isArray(r.issues) ? r.issues : [],
+      msg: r.msg || "",
+    }));
+}
+function readLocks() {
+  const out = [];
+  const now = Date.now();
+  let ents = [];
+  try { ents = fs.readdirSync(LOCKS_DIR, { withFileTypes: true }); } catch { return out; }
+  for (const ent of ents) {
+    if (!ent.isFile() || !ent.name.endsWith(".json")) continue;
+    let lock;
+    try { lock = JSON.parse(fs.readFileSync(path.join(LOCKS_DIR, ent.name), "utf8")); } catch { continue; }
+    if (Date.parse(lock.expires_at || "") > now) out.push(lock);
+  }
+  return out.sort((a, b) => String(a.path || "").localeCompare(String(b.path || "")));
+}
 
 // ---- coordinator subprocess (one persistent server.js over JSON-RPC) ----
+class BridgeChildError extends Error {}
+
 let child = null;
+let childReady = null;
 let rpcId = 0;
 const pending = new Map();
 let rpcBuf = "";
+let shuttingDown = false;
+let lastChildError = "";
 
 function startChild() {
+  if (child) return childReady || Promise.resolve();
+  ensureServerState();
+  rpcBuf = "";
   child = spawn(process.execPath, [SERVER_JS, "--self", SELF, "--store", STORE_DIR], {
     stdio: ["pipe", "pipe", "inherit"],
   });
@@ -103,26 +154,52 @@ function startChild() {
       }
     }
   });
-  child.on("exit", (code) => {
-    for (const { reject } of pending.values()) reject(new Error(`server exited (${code})`));
+  child.on("error", (e) => {
+    lastChildError = e.message || String(e);
+  });
+  child.on("exit", (code, signal) => {
+    const reason = `server exited (${code ?? signal ?? "unknown"})`;
+    lastChildError = reason;
+    for (const { reject } of pending.values()) reject(new BridgeChildError(reason));
     pending.clear();
     child = null;
+    childReady = null;
+    if (!shuttingDown) setTimeout(() => { try { startChild(); } catch {} }, 250);
   });
-  // MCP handshake
-  rpc("initialize", { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "viewer", version: "1" } });
-  child.stdin.write(JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" }) + "\n");
+  childReady = rpcRaw("initialize", { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "viewer", version: "1" } })
+    .then((res) => {
+      if (res.error) throw new BridgeChildError(res.error.message || "initialize failed");
+      if (!child || !child.stdin.writable) throw new BridgeChildError(lastChildError || "server unavailable");
+      child.stdin.write(JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" }) + "\n");
+      return true;
+    })
+    .catch((e) => {
+      lastChildError = e.message || String(e);
+      throw e instanceof BridgeChildError ? e : new BridgeChildError(lastChildError);
+    });
+  return childReady;
 }
 
-function rpc(method, params) {
-  if (!child) startChild();
+function rpcRaw(method, params) {
+  if (!child || !child.stdin.writable) throw new BridgeChildError(lastChildError || "server unavailable");
   const id = ++rpcId;
   return new Promise((resolve, reject) => {
     pending.set(id, { resolve, reject });
     setTimeout(() => {
       if (pending.has(id)) { pending.delete(id); reject(new Error("rpc timeout")); }
     }, 10000);
-    child.stdin.write(JSON.stringify({ jsonrpc: "2.0", id, method, params }) + "\n");
+    child.stdin.write(JSON.stringify({ jsonrpc: "2.0", id, method, params }) + "\n", (err) => {
+      if (err && pending.has(id)) {
+        pending.delete(id);
+        reject(new BridgeChildError(err.message || "server write failed"));
+      }
+    });
   });
+}
+
+async function rpc(method, params) {
+  await startChild();
+  return rpcRaw(method, params);
 }
 
 async function callTool(name, toolArgs) {
@@ -156,31 +233,44 @@ const server = http.createServer(async (req, res) => {
     }
     if (req.method === "GET" && url.pathname === "/api/state") {
       const records = readAll();
+      const receiptsCount = readReceipts().length;
       return json(res, 200, {
         self: SELF,
         messages: records,
         tasks: taskState(records),
         peers: peers(records),
+        reviews: reviews(records),
+        flocks: readLocks(),
+        receipts_count: receiptsCount,
+        receipts: receiptsCount,
       });
     }
     if (req.method === "POST" && url.pathname === "/api/action") {
       const body = await readBody(req);
       const { action } = body;
       let text;
-      if (action === "send") {
-        text = await callTool("send", { to: body.to, msg: body.msg, thread: body.thread || undefined });
-      } else if (action === "task") {
-        text = await callTool("task", {
-          task_id: body.task_id,
-          msg: body.msg || undefined,
-          spec_hash: body.spec_hash || sha256(`${body.task_id}\n${body.msg || ""}`),
-        });
-      } else if (action === "requeue") {
-        text = await callTool("requeue", { task_id: body.task_id, reason: body.reason || undefined });
-      } else if (action === "review") {
-        text = await callTool("review", { target: body.target, verdict: body.verdict, msg: body.msg || undefined });
-      } else {
-        return json(res, 400, { error: `unknown action: ${action}` });
+      try {
+        if (action === "send") {
+          text = await callTool("send", { to: body.to, msg: body.msg, thread: body.thread || undefined });
+        } else if (action === "task") {
+          text = await callTool("task", {
+            task_id: body.task_id,
+            msg: body.msg || undefined,
+            spec_hash: body.spec_hash || sha256(`${body.task_id}\n${body.msg || ""}`),
+          });
+        } else if (action === "requeue") {
+          text = await callTool("requeue", { task_id: body.task_id, reason: body.reason || undefined });
+        } else if (action === "review") {
+          text = await callTool("review", { target: body.target, verdict: body.verdict, msg: body.msg || undefined });
+        } else if (action === "prune") {
+          text = await callTool("prune", {});
+        } else {
+          return json(res, 400, { error: `unknown action: ${action}` });
+        }
+      } catch (e) {
+        const msg = String(e.message || e);
+        const code = e instanceof BridgeChildError || /server (exited|unavailable|write failed)|rpc timeout/i.test(msg) ? 503 : 500;
+        return json(res, code, { error: msg, child: code === 503 ? "unavailable" : undefined });
       }
       return json(res, 200, { ok: true, text });
     }
@@ -188,6 +278,11 @@ const server = http.createServer(async (req, res) => {
   } catch (e) {
     json(res, 500, { error: String(e.message || e) });
   }
+});
+
+process.on("exit", () => {
+  shuttingDown = true;
+  try { if (child) child.kill(); } catch {}
 });
 
 server.listen(PORT, "127.0.0.1", () => {
@@ -253,6 +348,9 @@ small{color:var(--mut)}
         <button onclick="act('review',{target:v('rvTarget'),verdict:'approve',msg:v('rvMsg')})">approve</button>
         <button onclick="act('review',{target:v('rvTarget'),verdict:'request_changes',msg:v('rvMsg')})">request changes</button>
       </div>
+    </fieldset>
+    <fieldset><legend>maintenance</legend>
+      <button onclick="act('prune',{})">prune</button>
     </fieldset>
     <fieldset><legend>send message</legend>
       <div class="row"><input id="snTo" placeholder="to (name / all)" value="all"><input id="snTh" placeholder="thread"></div>
