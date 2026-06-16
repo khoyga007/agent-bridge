@@ -1,0 +1,8 @@
+{
+  "name": "planner-executor-qa",
+  "roles": {
+    "claire": ["task", "requeue", "review"],
+    "celina": ["claim", "renew", "result"],
+    "ariel": ["claim", "renew", "result", "review"]
+  }
+}

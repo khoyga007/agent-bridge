@@ -1,0 +1,12 @@
+{
+  "policy_mode": "advisory",
+  "active_preset": "planner-executor-qa",
+  "allowed_actions": ["task", "claim", "renew", "result", "requeue", "review"],
+  "presets": {
+    "planner-executor-qa": {
+      "claire": ["task", "requeue", "review"],
+      "celina": ["claim", "renew", "result"],
+      "ariel": ["claim", "renew", "result", "review"]
+    }
+  }
+}

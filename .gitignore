@@ -1,0 +1,21 @@
+# Runtime state — regenerated on boot, agent-local
+messages.jsonl
+messages.*.jsonl
+receipts.jsonl
+receipts.*.jsonl
+state.json
+cursor.*.json
+cursor.*.txt
+cursors/
+locks/
+
+# Test artifacts
+test-store-*/
+
+# Node
+node_modules/
+npm-debug.log*
+
+# OS
+.DS_Store
+Thumbs.db
