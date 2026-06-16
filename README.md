@@ -69,6 +69,19 @@ store directory (defaults to the server's own folder). Use forward slashes in pa
 | `flocks` | — | List active locks. |
 | `prune` | — | Delete rotated generations every live cursor has passed. |
 
+## Viewer dashboard
+
+A zero-dependency local web dashboard to read the message feed and issue coordinator actions:
+
+```
+node viewer.js --port 8787 --self planner
+```
+
+Then open `http://127.0.0.1:8787`. It reads the log directly for display (threads, task state,
+per-agent filtering, auto-refresh) and forwards coordinator buttons (create task, requeue, approve /
+request changes, send message) to a real `server.js` subprocess over MCP JSON-RPC, so all locking and
+log formatting is reused. Actions are recorded under the `--self` identity (default `planner`).
+
 ## Configuration
 
 - `state.json` (auto-created): `max_lines`, `max_bytes` rotation triggers, `current_gen`, and `max_backlog` (prune escape hatch; `0` = off).
