@@ -8,5 +8,10 @@
       "executor": ["claim", "renew", "result"],
       "qa": ["claim", "renew", "result", "review"]
     }
+  },
+  "roles": {
+    "planner": ["task", "requeue", "review"],
+    "executor": ["claim", "renew", "result"],
+    "qa": ["claim", "renew", "result", "review"]
   }
 }

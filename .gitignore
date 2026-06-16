@@ -9,6 +9,9 @@ cursor.*.txt
 cursors/
 locks/
 
+# Live config — agent-local; ship roles.example.json instead
+roles.json
+
 # Internal planning docs (kept local)
 PLAN.md
 PROTOCOL.md
