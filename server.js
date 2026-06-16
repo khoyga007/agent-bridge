@@ -207,7 +207,29 @@ function pruneLocked(state = readState()) {
     if (state.max_backlog > 0 && cur.gen <= state.current_gen - state.max_backlog) ignored.push(item.agent);
     else active.push(cur);
   }
-  const minGen = active.length ? Math.min(...active.map((c) => c.gen)) : state.current_gen;
+  let minGen = active.length ? Math.min(...active.map((c) => c.gen)) : state.current_gen;
+
+  const tasks = taskState();
+  for (let gen = 0; gen < minGen; gen++) {
+    const file = genPath(LOG, gen, state.current_gen);
+    if (!fs.existsSync(file)) continue;
+    const records = readJsonl(file);
+    let hasOpenTask = false;
+    for (const r of records) {
+      if (r.type === "task") {
+        const s = tasks.get(r.task_id);
+        if (s && s.status !== "done") {
+          hasOpenTask = true;
+          break;
+        }
+      }
+    }
+    if (hasOpenTask) {
+      minGen = gen;
+      break;
+    }
+  }
+
   const deleted = [];
   for (let gen = 0; gen < minGen && gen < state.current_gen; gen++) {
     for (const file of [genPath(LOG, gen, state.current_gen), genPath(RECEIPTS, gen, state.current_gen)]) {
@@ -474,7 +496,9 @@ function toolTask({ task_id, spec_hash, requires_human, msg }) {
     msg: msg || `task ${taskId} spec=${hash}${requires_human ? " requires_human" : ""}`,
   });
   append(rec);
-  return withWarning(`task created (id ${taskId}, record ${rec.id})`, policy);
+  const s = taskState().get(taskId);
+  const landed = !!s;
+  return withWarning(`${landed ? "task created" : "task creation failed"} (id ${taskId}, record ${rec.id})\n${stateLine(taskId, s)}`, policy);
 }
 
 function toolClaim({ task_id, epoch, nonce, lease_seconds }) {

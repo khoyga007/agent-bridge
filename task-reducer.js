@@ -30,12 +30,16 @@ function actorFor(rec) {
   return String(rec.agent || rec.reviewer || rec.from || "").trim().toLowerCase();
 }
 
+function enforcePolicy(roles) {
+  return String(roles?.policy_mode || "").trim().toLowerCase() === "enforce";
+}
+
 function reduce(records, roles) {
   const state = new Map();
 
   for (const rec of records || []) {
     if (!rec || typeof rec !== "object" || typeof rec.type !== "string") continue;
-    if (!validateAction({ actor: actorFor(rec), action: rec.type }, roles).ok) continue;
+    if (enforcePolicy(roles) && !validateAction({ actor: actorFor(rec), action: rec.type }, roles).ok) continue;
     const taskId = String(rec.task_id || "").trim();
     if (!taskId) continue;
 

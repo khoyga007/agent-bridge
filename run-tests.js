@@ -10,7 +10,8 @@ const tests = [
   'test-review.js',
   'test-flock.js',
   'test-policy.js',
-  'test-viewer.js'
+  'test-viewer.js',
+  'test-task-verify.js'
 ];
 
 let allPassed = true;

@@ -144,6 +144,51 @@ async function runTest() {
   
   assert.deepStrictEqual(getGens(), [2, 3], "Should abort prune due to corrupt cursor of c");
 
+  // 7. PRUNE-OPEN: keep generation with open tasks
+  fs.unlinkSync(path.join(STORE, 'cursor.c.json'));
+  const state7 = JSON.parse(fs.readFileSync(stateFile, 'utf8'));
+  state7.max_backlog = 0;
+  fs.writeFileSync(stateFile, JSON.stringify(state7));
+
+  // A creates an open task in gen 3
+  await a.call('tools/call', { name: 'task', arguments: { task_id: 'open-task-1', spec_hash: 'abc' } });
+  await a.call('tools/call', { name: 'inbox', arguments: { limit: 0 } });
+  await b.call('tools/call', { name: 'inbox', arguments: { limit: 0 } });
+
+  // Send 60 msgs -> rotates to gen 4
+  for (let i = 180; i < 240; i++) {
+    await a.call('tools/call', { name: 'send', arguments: { to: 'all', msg: `msg ${i}` } });
+  }
+  await a.call('tools/call', { name: 'inbox', arguments: { limit: 0 } });
+  await b.call('tools/call', { name: 'inbox', arguments: { limit: 0 } });
+
+  // Send 60 msgs -> rotates to gen 5
+  for (let i = 240; i < 300; i++) {
+    await a.call('tools/call', { name: 'send', arguments: { to: 'all', msg: `msg ${i}` } });
+  }
+  await a.call('tools/call', { name: 'inbox', arguments: { limit: 0 } });
+  await b.call('tools/call', { name: 'inbox', arguments: { limit: 0 } });
+
+  const gensBefore = getGens();
+  assert(gensBefore.includes(3) && gensBefore.includes(4), "Should have gens 3 and 4");
+
+  // Prune -> should KEEP gen 3 (where task is) and all gens after it.
+  await a.call('tools/call', { name: 'prune', arguments: {} });
+  const gensAfterPruneOpen = getGens();
+  assert.strictEqual(gensAfterPruneOpen[0], 3, "Should prune up to gen 2 but keep gen 3 due to open task");
+
+  // Complete the task
+  await a.call('tools/call', { name: 'claim', arguments: { task_id: 'open-task-1' } });
+  await a.call('tools/call', { name: 'result', arguments: { task_id: 'open-task-1', epoch: 0, result_hash: 'done' } });
+  
+  await a.call('tools/call', { name: 'inbox', arguments: { limit: 0 } });
+  await b.call('tools/call', { name: 'inbox', arguments: { limit: 0 } });
+
+  // Prune -> now gen 3 and 4 can be deleted (task is done)
+  await a.call('tools/call', { name: 'prune', arguments: {} });
+  const finalGens = getGens();
+  assert(finalGens[0] > 3, "Should prune gen 3 and 4 after task is done");
+
   a.kill(); b.kill(); c.kill();
   console.log("ALL TESTS PASSED: test-p5-prune");
 }

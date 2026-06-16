@@ -60,6 +60,21 @@ function runTests() {
     assert.strictEqual(state.winner_agent, 'executor', "Reducer should drop claim from unauthorized actor (planner)");
   }
 
+  const unauthorizedEvents = [
+    { type: 'task', task_id: 'mode1', epoch: 0, from: 'planner' },
+    { type: 'claim', task_id: 'mode1', epoch: 0, agent: 'planner' }
+  ];
+  const enforceState = reduce(unauthorizedEvents, { ...roles, policy_mode: 'enforce' }).get('mode1');
+  assert.strictEqual(enforceState.status, 'open', "enforce mode should drop unauthorized claim");
+
+  const advisoryState = reduce(unauthorizedEvents, { ...roles, policy_mode: 'advisory' }).get('mode1');
+  assert.strictEqual(advisoryState.status, 'claimed', "advisory mode should keep unauthorized records in reducer");
+  assert.strictEqual(advisoryState.winner_agent, 'planner');
+
+  const offState = reduce(unauthorizedEvents, { ...roles, policy_mode: 'off' }).get('mode1');
+  assert.strictEqual(offState.status, 'claimed', "off mode should keep unauthorized records in reducer");
+  assert.strictEqual(offState.winner_agent, 'planner');
+
   console.log("ALL TESTS PASSED: test-policy");
 }
 
