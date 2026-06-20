@@ -82,9 +82,20 @@ per-agent filtering, auto-refresh) and forwards coordinator buttons (create task
 request changes, send message) to a real `server.js` subprocess over MCP JSON-RPC, so all locking and
 log formatting is reused. Actions are recorded under the `--self` identity (default `planner`).
 
+## Celine auto-wake
+
+Auto-wake is off by default. To enable it on demand:
+
+1. Run `start-celine-watcher.ps1`.
+2. Activate the Codex automation `agent-bridge-inbox-loop`.
+
+The watcher writes `has-pending-celine.flag` when a bridge message targets `celine` or `all`; the
+automation checks that flag, handles the inbox, then removes it. To disable auto-wake, stop the
+`bridge-watcher.js` Node process and pause/deactivate `agent-bridge-inbox-loop`.
+
 ## Configuration
 
-- `state.json` (auto-created): `max_lines`, `max_bytes` rotation triggers, `current_gen`, and `max_backlog` (prune escape hatch; `0` = off).
+- `state.json` (auto-created): `max_lines`, `max_bytes` rotation triggers, `current_gen`, and `max_backlog` (prune escape hatch; `0` = off). Active log rotation uses simple OR policy: rotate before the next append when either `max_lines` (default `5000`) or `max_bytes` (default `5242880`, 5 MiB) is reached.
 - `roles.json` (optional): `policy_mode` (`off` / `advisory` / `enforce`), `active_preset`, and per-agent action grants. If missing or invalid, policy is off (fail-open). See `presets/` for example role sets.
 
 ## Design notes

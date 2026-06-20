@@ -11,7 +11,9 @@ const tests = [
   'test-flock.js',
   'test-policy.js',
   'test-viewer.js',
-  'test-task-verify.js'
+  'test-bridge-watcher.js',
+  'test-task-verify.js',
+  'test-snap.js'
 ];
 
 let allPassed = true;

@@ -19,6 +19,18 @@ P1P2-proposal.md
 
 # Test artifacts
 test-store-*/
+fuzz-*-store/
+isolated/
+resume-test-*.txt
+smoke-test-prompt.txt
+state.snap.json
+
+# Doorbell flags + loop logs — runtime, agent-local
+has-pending-*.flag
+*.log
+
+# Neural memory — local
+.neuralmemory/
 
 # Node
 node_modules/

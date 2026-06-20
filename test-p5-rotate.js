@@ -78,6 +78,59 @@ async function runTest() {
   assert(cCursor.offset > offset, "Migrated cursor offset should have advanced");
   console.log(" Legacy migration pass.");
 
+  // --- Flush policy: byte OR line count rotate triggers ---
+  console.log("Testing flush policy OR triggers...");
+  fs.rmSync(STORE, { recursive: true, force: true });
+  fs.mkdirSync(STORE);
+  fs.writeFileSync(path.join(STORE, 'state.json'), JSON.stringify({
+    current_gen: 0, rotated_at: null, max_lines: 2, max_bytes: 1024 * 1024
+  }) + '\n');
+  const lineClient = createClient('agent_a');
+  for (let i = 0; i < 3; i++) {
+    await lineClient.call('tools/call', { name: 'send', arguments: { to: 'agent_b', msg: `line trigger ${i}` }});
+  }
+  lineClient.kill();
+  let flushState = JSON.parse(fs.readFileSync(path.join(STORE, 'state.json'), 'utf8'));
+  assert(flushState.current_gen >= 1, "max_lines should rotate even when max_bytes is not reached");
+
+  fs.rmSync(STORE, { recursive: true, force: true });
+  fs.mkdirSync(STORE);
+  fs.writeFileSync(path.join(STORE, 'state.json'), JSON.stringify({
+    current_gen: 0, rotated_at: null, max_lines: 1000, max_bytes: 200
+  }) + '\n');
+  const byteClient = createClient('agent_a');
+  await byteClient.call('tools/call', { name: 'send', arguments: { to: 'agent_b', msg: 'x'.repeat(500) }});
+  await byteClient.call('tools/call', { name: 'send', arguments: { to: 'agent_b', msg: 'byte trigger' }});
+  byteClient.kill();
+  flushState = JSON.parse(fs.readFileSync(path.join(STORE, 'state.json'), 'utf8'));
+  assert(flushState.current_gen >= 1, "max_bytes should rotate even when max_lines is not reached");
+  console.log(" Flush policy OR trigger pass.");
+
+  // --- Crash recovery: orphaned rotated gen before state bump ---
+  console.log("Testing orphaned rotate recovery...");
+  fs.rmSync(STORE, { recursive: true, force: true });
+  fs.mkdirSync(STORE);
+  fs.writeFileSync(path.join(STORE, 'messages.0.jsonl'), JSON.stringify({
+    id: 'old-msg', ts: new Date().toISOString(), from: 'agent_a', to: 'agent_c', msg: 'old gen'
+  }) + '\n');
+  fs.writeFileSync(path.join(STORE, 'messages.jsonl'), JSON.stringify({
+    id: 'active-msg', ts: new Date().toISOString(), from: 'agent_a', to: 'agent_c', msg: 'active gen'
+  }) + '\n');
+  fs.writeFileSync(path.join(STORE, 'receipts.jsonl'), JSON.stringify({
+    id: 'old-receipt', msg_id: 'old-msg', agent: 'agent_c', read_at: new Date().toISOString()
+  }) + '\n');
+  fs.writeFileSync(path.join(STORE, 'state.json'), JSON.stringify({
+    current_gen: 0, rotated_at: null, max_lines: 1, max_bytes: 1024 * 1024, max_backlog: 0
+  }) + '\n');
+  const recoveryClient = createClient('agent_a');
+  await recoveryClient.call('tools/call', { name: 'send', arguments: { to: 'agent_c', msg: 'after recovery' }});
+  recoveryClient.kill();
+  const recoveredState = JSON.parse(fs.readFileSync(path.join(STORE, 'state.json'), 'utf8'));
+  assert(recoveredState.current_gen >= 1, "orphan recovery should bump current_gen before next rotate");
+  assert(fs.existsSync(path.join(STORE, 'messages.0.jsonl')), "orphaned messages gen should remain readable");
+  assert(fs.existsSync(path.join(STORE, 'receipts.0.jsonl')), "active receipts from half-rotate should be reconciled to gen 0");
+  console.log(" Orphaned rotate recovery pass.");
+
   // Clean store for main test
   fs.rmSync(STORE, { recursive: true, force: true });
   fs.mkdirSync(STORE);
@@ -116,8 +169,16 @@ async function runTest() {
       await new Promise(r => setTimeout(r, 10)); // small sleep
     }
   })();
+  const pMeta = (async () => {
+    for (let i = 0; i < 50; i++) {
+      await cOnline.call('tools/call', { name: 'peers', arguments: {} });
+      await cOnline.call('tools/call', { name: 'threads', arguments: {} });
+      await cOnline.call('tools/call', { name: 'receipts', arguments: {} });
+      await cOnline.call('tools/call', { name: 'context', arguments: {} });
+    }
+  })();
   
-  await Promise.all([pA, pB, pC]);
+  await Promise.all([pA, pB, pC, pMeta]);
   cOnline.kill();
   
   const state = JSON.parse(fs.readFileSync(path.join(STORE, 'state.json'), 'utf8'));

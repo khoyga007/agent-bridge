@@ -28,6 +28,7 @@ const STORE_DIR = arg("--store", __dirname);
 const LOG = path.join(STORE_DIR, "messages.jsonl");
 const RECEIPTS = path.join(STORE_DIR, "receipts.jsonl");
 const STATE = path.join(STORE_DIR, "state.json");
+const SNAP = path.join(STORE_DIR, "state.snap.json");
 const ROLES = path.join(STORE_DIR, "roles.json");
 const CURSOR = path.join(STORE_DIR, `cursor.${SELF}.json`);
 const LEGACY_CURSOR = path.join(STORE_DIR, `cursor.${SELF}.txt`);
@@ -69,6 +70,42 @@ function writeState(state) {
   atomicWrite(STATE, JSON.stringify(state, null, 2) + "\n");
 }
 
+function emptySnap() {
+  return {
+    schema_version: 1,
+    source: { gen: 0, offset: 0, last_id: null, ts: null },
+    open_tasks: [],
+    recent_reviews: [],
+    threads_latest: {},
+  };
+}
+
+function normalizeSnap(raw) {
+  if (!raw || typeof raw !== "object" || raw.schema_version !== 1) throw new Error("unsupported snap schema");
+  if (!raw.source || typeof raw.source !== "object") throw new Error("invalid snap source");
+  return {
+    schema_version: 1,
+    source: {
+      gen: Math.trunc(Number(raw.source.gen ?? 0)),
+      offset: Math.trunc(Number(raw.source.offset ?? 0)),
+      last_id: raw.source.last_id || null,
+      ts: raw.source.ts || null,
+    },
+    open_tasks: Array.isArray(raw.open_tasks) ? raw.open_tasks : [],
+    recent_reviews: Array.isArray(raw.recent_reviews) ? raw.recent_reviews.slice(-50) : [],
+    threads_latest: raw.threads_latest && typeof raw.threads_latest === "object" ? raw.threads_latest : {},
+  };
+}
+
+function readSnap() {
+  if (!fs.existsSync(SNAP)) return null;
+  return normalizeSnap(JSON.parse(fs.readFileSync(SNAP, "utf8")));
+}
+
+function writeSnap(snap) {
+  atomicWrite(SNAP, JSON.stringify(normalizeSnap(snap), null, 2) + "\n");
+}
+
 function readJsonl(file) {
   const raw = fs.readFileSync(file, "utf8");
   const out = [];
@@ -86,17 +123,19 @@ function genPath(active, gen, currentGen) {
   return `${base}.${gen}${ext}`;
 }
 function readGenerations(active) {
-  const state = readState();
-  const out = [];
-  for (let gen = 0; gen <= state.current_gen; gen++) {
-    const file = genPath(active, gen, state.current_gen);
-    if (!fs.existsSync(file)) {
-      if (gen === state.current_gen) fs.writeFileSync(file, "");
-      else continue;
+  return withLock(GLOBAL_LOCK, () => {
+    const state = readState();
+    const out = [];
+    for (let gen = 0; gen <= state.current_gen; gen++) {
+      const file = genPath(active, gen, state.current_gen);
+      if (!fs.existsSync(file)) {
+        if (gen === state.current_gen) fs.writeFileSync(file, "");
+        else continue;
+      }
+      out.push(...readJsonl(file));
     }
-    out.push(...readJsonl(file));
-  }
-  return out;
+    return out;
+  }, true);
 }
 function readAll() { return readGenerations(LOG); }
 function readReceipts() { return readGenerations(RECEIPTS); }
@@ -134,8 +173,10 @@ function withWarning(text, policy) {
 }
 // P2: cross-process advisory lock so two agents never interleave a write.
 function sleepSync(ms) { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); }
+const HELD_LOCKS = new Map();
 function withLock(file, fn, strict = false) {
   const lock = file + ".lock";
+  if (HELD_LOCKS.has(lock)) return fn();
   for (let i = 0; i < 50; i++) {
     let fd;
     try { fd = fs.openSync(lock, "wx"); }            // 'wx' = fail if exists
@@ -144,7 +185,15 @@ function withLock(file, fn, strict = false) {
       try { if (Date.now() - fs.statSync(lock).mtimeMs > 5000) fs.unlinkSync(lock); } catch { /* race */ }
       sleepSync(20); continue;                       // spin ~1s then fall through
     }
-    try { return fn(); } finally { try { fs.closeSync(fd); } finally { try { fs.unlinkSync(lock); } catch {} } }
+    try {
+      HELD_LOCKS.set(lock, (HELD_LOCKS.get(lock) || 0) + 1);
+      return fn();
+    } finally {
+      const held = HELD_LOCKS.get(lock) || 0;
+      if (held <= 1) HELD_LOCKS.delete(lock);
+      else HELD_LOCKS.set(lock, held - 1);
+      try { fs.closeSync(fd); } finally { try { fs.unlinkSync(lock); } catch {} }
+    }
   }
   if (strict) throw new Error(`could not acquire lock: ${lock}`);
   return fn();                                       // fallback: O_APPEND is atomic for small records
@@ -157,10 +206,177 @@ function waitNoGlobalLock() {
     sleepSync(20);
   }
 }
+
+function rotatedGensFor(active) {
+  const ext = active.endsWith(".jsonl") ? ".jsonl" : "";
+  const base = path.basename(ext ? active.slice(0, -ext.length) : active);
+  const re = new RegExp(`^${base.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\.(\\d+)${ext.replace(".", "\\.")}$`);
+  const gens = [];
+  for (const ent of fs.readdirSync(STORE_DIR, { withFileTypes: true })) {
+    if (!ent.isFile()) continue;
+    const m = re.exec(ent.name);
+    if (m) gens.push(Number(m[1]));
+  }
+  return gens.filter((n) => Number.isInteger(n) && n >= 0);
+}
+
+function recoverRotationsLocked() {
+  let state = readState();
+  const msgGens = rotatedGensFor(LOG);
+  const receiptGens = rotatedGensFor(RECEIPTS);
+  const orphanGens = [...new Set([...msgGens, ...receiptGens])]
+    .filter((gen) => gen >= state.current_gen)
+    .sort((a, b) => a - b);
+  if (!orphanGens.length) return false;
+
+  for (const gen of orphanGens) {
+    const msgFile = genPath(LOG, gen, gen + 1);
+    const receiptFile = genPath(RECEIPTS, gen, gen + 1);
+    if (!fs.existsSync(msgFile)) fs.writeFileSync(msgFile, "");
+    if (!fs.existsSync(receiptFile)) {
+      if (gen === state.current_gen && fs.existsSync(RECEIPTS)) fs.renameSync(RECEIPTS, receiptFile);
+      else fs.writeFileSync(receiptFile, "");
+    }
+  }
+
+  state = {
+    ...state,
+    current_gen: Math.max(state.current_gen, orphanGens[orphanGens.length - 1] + 1),
+    rotated_at: state.rotated_at || new Date().toISOString(),
+  };
+  if (!fs.existsSync(LOG)) fs.writeFileSync(LOG, "");
+  if (!fs.existsSync(RECEIPTS)) fs.writeFileSync(RECEIPTS, "");
+  writeState(state);
+  try { rebuildSnapLocked(readAll(), state); } catch (e) { process.stderr.write(`agent-bridge recovery snap rebuild failed: ${e.message}\n`); }
+  process.stderr.write(`agent-bridge recovered orphan rotation gens: ${orphanGens.join(",")}; current_gen=${state.current_gen}\n`);
+  return true;
+}
+
+function recoverRotationsOnStartup() {
+  withLock(GLOBAL_LOCK, () => recoverRotationsLocked(), true);
+}
+
 function lineCount(file) {
   if (!fs.existsSync(file)) return 0;
   const raw = fs.readFileSync(file, "utf8");
   return raw ? (raw.match(/\n/g) || []).length : 0;
+}
+
+function toAgent(m, agent) {
+  if (m.from === agent) return false;
+  if (m.to === "all") return true;
+  if (Array.isArray(m.to)) return m.to.includes(agent);
+  return m.to === agent;
+}
+function flagPath(agent) {
+  const safe = String(agent || "").trim().toLowerCase().replace(/[^a-z0-9_-]/g, "");
+  return safe ? path.join(STORE_DIR, `has-pending-${safe}.flag`) : null;
+}
+function knownAgents() {
+  const seen = new Set();
+  for (const m of readAll()) {
+    if (m.from) seen.add(m.from);
+    if (m.to === "all") continue;
+    if (Array.isArray(m.to)) m.to.forEach((x) => seen.add(x));
+    else if (m.to) seen.add(m.to);
+  }
+  seen.delete("all");
+  seen.delete(SELF);
+  return [...seen].filter(Boolean);
+}
+function touchFlag(agent) {
+  const file = flagPath(agent);
+  if (file) atomicWrite(file, new Date().toISOString() + "\n");
+}
+function touchRecipientFlags(rec) {
+  if (!rec) return;
+  if (rec.to === "all") return knownAgents().forEach(touchFlag);
+  const list = Array.isArray(rec.to) ? rec.to : [rec.to];
+  for (const agent of list) if (agent && agent !== SELF) touchFlag(agent);
+}
+function clearOwnFlag() {
+  const file = flagPath(SELF);
+  try { if (file && fs.existsSync(file)) fs.unlinkSync(file); } catch {}
+}
+
+function sourceForCurrentLog(state) {
+  const file = genPath(LOG, state.current_gen, state.current_gen);
+  const offset = fs.existsSync(file) ? fs.statSync(file).size : 0;
+  let lastId = null;
+  if (offset > 0) {
+    const records = readJsonl(file);
+    for (let i = records.length - 1; i >= 0; i--) {
+      if (records[i].id) {
+        lastId = records[i].id;
+        break;
+      }
+    }
+  }
+  return { gen: state.current_gen, offset, last_id: lastId, ts: new Date().toISOString() };
+}
+
+function taskSnapItems(records = readAll(), roles = readRoles()) {
+  return [...reduceTasks(records, roles).entries()]
+    .filter(([, s]) => s.status !== "done")
+    .map(([id, s]) => ({
+      id,
+      state: s.status,
+      claimed_by: s.winner_agent || null,
+      epoch: s.epoch,
+      spec_hash: s.spec_hash || null,
+    }));
+}
+
+function applyRecordToSnap(snap, rec, recordsForTasks = null) {
+  if (!rec || typeof rec !== "object") return snap;
+  if (rec.thread) {
+    const prev = snap.threads_latest[rec.thread];
+    snap.threads_latest[rec.thread] = {
+      last_msg_id: rec.id || null,
+      last_ts: rec.ts || null,
+      last_from: rec.from || null,
+      msg_count: (prev?.msg_count || 0) + 1,
+    };
+  }
+  if (rec.type === "review") {
+    snap.recent_reviews.push({
+      target: rec.target,
+      verdict: rec.verdict,
+      reviewer: rec.reviewer || rec.from,
+      ts: rec.ts || null,
+    });
+    snap.recent_reviews = snap.recent_reviews.slice(-50);
+  }
+  if (["task", "claim", "renew", "result", "requeue"].includes(rec.type)) {
+    snap.open_tasks = taskSnapItems(recordsForTasks || readAll(), readRoles());
+  }
+  return snap;
+}
+
+function rebuildSnapLocked(records = readAll(), state = readState()) {
+  const snap = emptySnap();
+  for (const rec of records) applyRecordToSnap(snap, rec, records);
+  snap.source = sourceForCurrentLog(state);
+  writeSnap(snap);
+  return snap;
+}
+
+function updateSnapAfterAppendLocked(rec, beforeSize) {
+  try {
+    const state = readState();
+    let snap;
+    try { snap = readSnap(); } catch { snap = null; }
+    if (!snap || snap.source.gen !== state.current_gen || snap.source.offset < beforeSize) {
+      return rebuildSnapLocked(readAll(), state);
+    }
+    applyRecordToSnap(snap, rec);
+    snap.source = sourceForCurrentLog(state);
+    writeSnap(snap);
+    return snap;
+  } catch (e) {
+    process.stderr.write(`agent-bridge snap update failed: ${e.message}\n`);
+    return null;
+  }
 }
 
 function parseCursorFile(file) {
@@ -246,6 +462,109 @@ function toolPrune() {
   return `prune deleted=${res.deleted.length ? res.deleted.join(",") : "none"} min_gen=${res.min_gen}${ignored}`;
 }
 
+function offsetAfterIdInGen(id, gen, state = readState()) {
+  const file = genPath(LOG, gen, state.current_gen);
+  if (!id || !fs.existsSync(file)) return { found: !id, offset: 0, last_id: null };
+  const text = fs.readFileSync(file, "utf8");
+  let pos = 0;
+  for (const line of text.split("\n")) {
+    const lineBytes = Buffer.byteLength(line, "utf8");
+    const s = line.trim();
+    if (s) {
+      let m; try { m = JSON.parse(s); } catch { m = null; }
+      if (m && m.id === id) return { found: true, offset: pos + lineBytes + 1, last_id: id };
+    }
+    pos += lineBytes + 1;
+  }
+  return { found: false, offset: fs.statSync(file).size, last_id: id };
+}
+
+function rewriteJsonCursor(file, patch) {
+  let cur;
+  try { cur = normalizeCursor(JSON.parse(fs.readFileSync(file, "utf8"))); } catch { return; }
+  const next = patch(cur);
+  if (next) atomicWrite(file, JSON.stringify(normalizeCursor(next), null, 2) + "\n");
+}
+
+function fixCursorsAfterDelete(changes, state) {
+  if (!changes.length) return;
+  const byGen = new Map();
+  for (const c of changes) {
+    if (!byGen.has(c.gen)) byGen.set(c.gen, new Map());
+    byGen.get(c.gen).set(c.id, c.prev_id);
+  }
+  const files = [];
+  for (const ent of fs.readdirSync(STORE_DIR, { withFileTypes: true })) {
+    if (ent.isFile() && /^cursor\.[^.]+\.json$/.test(ent.name)) files.push(path.join(STORE_DIR, ent.name));
+  }
+  const dir = path.join(STORE_DIR, "cursors");
+  if (fs.existsSync(dir)) {
+    for (const ent of fs.readdirSync(dir, { withFileTypes: true })) {
+      if (ent.isFile() && ent.name.endsWith(".json")) files.push(path.join(dir, ent.name));
+    }
+  }
+  for (const file of files) rewriteJsonCursor(file, (cur) => {
+    const deleted = byGen.get(cur.gen);
+    if (!deleted) return null;
+    const anchor = deleted.has(cur.last_id) ? deleted.get(cur.last_id) : cur.last_id;
+    const pos = offsetAfterIdInGen(anchor, cur.gen, state);
+    if (!pos.found && cur.last_id) return { ...cur, offset: Math.min(cur.offset, pos.offset) };
+    return { ...cur, offset: pos.offset, last_id: pos.last_id };
+  });
+}
+
+function deleteIds({ id, ids } = {}) {
+  const raw = Array.isArray(ids) ? ids : [id];
+  const out = [...new Set(raw.map((x) => String(x || "").trim()).filter(Boolean))];
+  if (!out.length) throw new Error("id or ids required");
+  return out;
+}
+
+function toolDelete(args = {}) {
+  let wants;
+  try { wants = deleteIds(args); } catch (e) { return JSON.stringify({ ok: false, error: e.message }); }
+  const wantSet = new Set(wants);
+  return withLock(GLOBAL_LOCK, () => {
+    const state = readState();
+    const deleted = [];
+    const changes = [];
+    for (let gen = 0; gen <= state.current_gen; gen++) {
+      const file = genPath(LOG, gen, state.current_gen);
+      if (!fs.existsSync(file)) continue;
+      const lines = fs.readFileSync(file, "utf8").split("\n");
+      const kept = [];
+      let changed = false;
+      let prevId = null;
+      for (const line of lines) {
+        const s = line.trim();
+        if (!s) continue;
+        let rec;
+        try { rec = JSON.parse(s); } catch {
+          kept.push(line);
+          continue;
+        }
+        if (wantSet.has(rec.id)) {
+          changed = true;
+          deleted.push(rec.id);
+          changes.push({ gen, id: rec.id, prev_id: prevId });
+          continue;
+        }
+        if (rec.id) prevId = rec.id;
+        kept.push(line);
+      }
+      if (changed) atomicWrite(file, kept.length ? `${kept.join("\n")}\n` : "");
+    }
+    if (deleted.length) {
+      fixCursorsAfterDelete(changes, state);
+      rebuildSnapLocked(readAll(), state);
+    }
+    const deletedSet = new Set(deleted);
+    const notFound = wants.filter((x) => !deletedSet.has(x));
+    if (!deleted.length && wants.length === 1) return JSON.stringify({ ok: false, error: "id not found", deleted: [], not_found: notFound });
+    return JSON.stringify({ ok: true, deleted, not_found: notFound });
+  }, true);
+}
+
 function maybeRotate() {
   withLock(GLOBAL_LOCK, () => {
     const state = readState();
@@ -270,6 +589,7 @@ function maybeRotate() {
         max_bytes: state.max_bytes,
         max_backlog: state.max_backlog,
       });
+      try { rebuildSnapLocked(readAll(), readState()); } catch (e) { process.stderr.write(`agent-bridge snap rebuild failed: ${e.message}\n`); }
       try { pruneLocked(readState()); } catch { /* prune aborts without blocking rotate/append */ }
     }, true), true);
   }, true);
@@ -277,6 +597,14 @@ function maybeRotate() {
 function appendTo(file, rec) {
   if (file === LOG) maybeRotate();
   waitNoGlobalLock();
+  if (file === LOG) {
+    withLock(GLOBAL_LOCK, () => {
+      const beforeSize = fs.existsSync(LOG) ? fs.statSync(LOG).size : 0;
+      withLock(file, () => fs.appendFileSync(file, JSON.stringify(rec) + "\n"), true);
+      updateSnapAfterAppendLocked(rec, beforeSize);
+    }, true);
+    return;
+  }
   withLock(file, () => fs.appendFileSync(file, JSON.stringify(rec) + "\n"));
 }
 function append(rec) { appendTo(LOG, rec); }
@@ -404,6 +732,7 @@ function makeMessage({ to, msg, thread, reply_to }) {
 function toolSend({ to, msg, thread, reply_to }) {
   const rec = makeMessage({ to, msg, thread, reply_to });
   append(rec);
+  touchRecipientFlags(rec);
   return `sent -> ${toStr(rec.to)} (id ${rec.id}${rec.thread ? `, thread ${rec.thread}` : ""}${rec.reply_to ? `, reply_to ${rec.reply_to}` : ""})`;
 }
 
@@ -441,7 +770,9 @@ function appendAfterCheck(rec, check) {
   waitNoGlobalLock();
   withLock(GLOBAL_LOCK, () => {
     check();
+    const beforeSize = fs.existsSync(LOG) ? fs.statSync(LOG).size : 0;
     withLock(LOG, () => fs.appendFileSync(LOG, JSON.stringify(rec) + "\n"), true);
+    updateSnapAfterAppendLocked(rec, beforeSize);
   }, true);
 }
 
@@ -589,10 +920,12 @@ function toolInbox({ since, all, peek, limit }) {
       const list = i >= 0 ? msgs.slice(i + 1) : msgs;
       const shown = list.slice(0, max);
       if (!peek) markRead(shown);
+      if (!peek) clearOwnFlag();
       return fmt(shown, { has_more: list.length > shown.length, unread_remaining: Math.max(0, list.length - shown.length) });
     }
     const shown = msgs.slice(0, max);
     if (!peek) markRead(shown);
+    if (!peek) clearOwnFlag();
     return fmt(shown, { has_more: msgs.length > shown.length, unread_remaining: Math.max(0, msgs.length - shown.length) });
   }
   // default: incremental read from {gen, offset}, crossing immutable generations.
@@ -654,10 +987,12 @@ function toolInbox({ since, all, peek, limit }) {
       else break;
     }
     const hasMore = remaining > 0;
-    return { out, next: hasMore && limitEnd ? limitEnd : scanEnd, has_more: hasMore, unread_remaining: remaining };
+    const nextCursor = hasMore && limitEnd ? limitEnd : (out.length ? scanEnd : cursor);
+    return { out, next: nextCursor, has_more: hasMore, unread_remaining: remaining };
   }, true);
   if (!peek) setCursor(scan.next);
   if (!peek) markReadOnce(scan.out);
+  if (!peek) clearOwnFlag();
   return fmt(scan.out, { has_more: scan.has_more, unread_remaining: scan.unread_remaining });
 }
 
@@ -668,7 +1003,7 @@ function toolSync({ outbox, limit, peek } = {}) {
     if (!item || typeof item !== "object" || Array.isArray(item)) throw new Error("each outbox item must be an object");
     return makeMessage(item);
   });
-  for (const rec of records) append(rec);
+  for (const rec of records) { append(rec); touchRecipientFlags(rec); }
   return toolInbox({ limit, peek });
 }
 
@@ -874,6 +1209,66 @@ function toolReceipts({ thread, msg_id } = {}) {
     .join("\n");
 }
 
+function cursorPathForAgent(agent) {
+  return {
+    json: path.join(STORE_DIR, `cursor.${agent}.json`),
+    txt: path.join(STORE_DIR, `cursor.${agent}.txt`),
+  };
+}
+
+function readCursorForAgent(agent) {
+  const p = cursorPathForAgent(agent);
+  if (fs.existsSync(p.json)) return parseCursorFile(p.json);
+  if (fs.existsSync(p.txt)) return parseCursorFile(p.txt);
+  return { gen: 0, offset: 0, last_id: null };
+}
+
+function unreadCountForAgent(agent) {
+  const seen = new Set(readReceipts()
+    .filter((r) => r.agent === agent)
+    .map((r) => r.msg_id));
+  return readAll().filter((m) => toAgent(m, agent) && !seen.has(m.id)).length;
+}
+
+function readOrRebuildSnap() {
+  try {
+    const snap = readSnap();
+    if (snap) return snap;
+  } catch { /* rebuild below */ }
+  return withLock(GLOBAL_LOCK, () => rebuildSnapLocked(readAll(), readState()), true);
+}
+
+function toolContext({ agent } = {}) {
+  const who = String(agent || SELF).trim().toLowerCase();
+  if (!who) throw new Error("`agent` must be non-empty");
+  const snap = readOrRebuildSnap();
+  const state = readState();
+  const activeSize = fs.existsSync(LOG) ? fs.statSync(LOG).size : 0;
+  const stale = snap.source.gen !== state.current_gen || snap.source.offset < activeSize;
+  const yourOpenTasks = snap.open_tasks.filter((t) => (
+    t.claimed_by === who || t.state === "open" || t.state === "requeued"
+  ));
+  const yourPendingReviews = snap.recent_reviews.filter((r) => r.reviewer !== who && (
+    r.verdict === "request_changes" || String(r.target || "").includes(who)
+  ));
+  const cursor = readCursorForAgent(who);
+  return JSON.stringify({
+    schema_version: 1,
+    agent: who,
+    stale,
+    source: snap.source,
+    cursor,
+    unread_count: unreadCountForAgent(who),
+    your_open_tasks: yourOpenTasks,
+    your_pending_reviews: yourPendingReviews,
+    snapshot: {
+      open_tasks: yourOpenTasks,
+      recent_reviews: snap.recent_reviews,
+      threads_latest: snap.threads_latest,
+    },
+  }, null, 2);
+}
+
 const TOOLS = [
   {
     name: "send",
@@ -924,6 +1319,27 @@ const TOOLS = [
         },
         limit: { type: "integer", minimum: 0, description: "Forwarded to inbox. Default unread limit is 20; 0 means unlimited." },
         peek: { type: "boolean", description: "Forwarded to inbox; do not advance cursor." },
+      },
+    },
+  },
+  {
+    name: "del_msg",
+    description: "Delete one message record by id from the active or rotated message store, then rebuild the snapshot.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        id: { type: "string", description: "Message record id to delete." },
+      },
+      required: ["id"],
+    },
+  },
+  {
+    name: "context",
+    description: "Return a compact catch-up snapshot for an agent: unread count, open tasks, recent review signals, thread heads, and stale/fallback metadata.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        agent: { type: "string", description: "Agent address to summarize. Defaults to this server's --self." },
       },
     },
   },
@@ -1093,6 +1509,8 @@ function callTool(name, a = {}) {
   if (name === "send") text = toolSend(a);
   else if (name === "inbox") text = toolInbox(a);
   else if (name === "sync") text = toolSync(a);
+  else if (name === "del_msg") text = toolDelete(a); // ponytail: 'delete' is a JS/TS reserved word, breaks Goose Code Mode codegen
+  else if (name === "context") text = toolContext(a);
   else if (name === "peers") text = toolPeers();
   else if (name === "threads") text = toolThreads();
   else if (name === "receipts") text = toolReceipts(a);
@@ -1139,6 +1557,7 @@ function handle(msg) {
 }
 
 let buf = "";
+recoverRotationsOnStartup();
 process.stdin.setEncoding("utf8");
 process.stdin.on("data", (chunk) => {
   buf += chunk;
